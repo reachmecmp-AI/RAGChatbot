@@ -8,3 +8,4 @@ pydantic
 streamlit
 OpenAI
 google-genai
+chromadb
