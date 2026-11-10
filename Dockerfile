@@ -3,7 +3,7 @@ FROM python:3.14-slim
 WORKDIR /app
 
 COPY requirements.txt
-RUN uv add -r requirements.txt
+RUN pip install -r requirements.txt
 
 COPY streamlit_app_tfdl.py
 COPY streamlit_app.py
