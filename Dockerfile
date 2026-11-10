@@ -1,13 +1,23 @@
-FROM python:3.14-slim
+
+FROM python:3.12-slim
 
 WORKDIR /app
 
+# Copy requirements
 COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY streamlit_app_tfdl.py
-COPY streamlit_app.py
+# Copy application files
+COPY streamlit_app.py .
+COPY streamlit_app_tfdl.py .
 
-COPY _data ./_data
+# Copy policy documents
+COPY _data/ ./_data/
 
-CMD ["streamlit","run", "streamlit_app_tfdl.py", "--server.port=10000", "--server.address=0.0.0.0" ]
+# Streamlit port
+EXPOSE 8501
+
+# Start application
+CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
