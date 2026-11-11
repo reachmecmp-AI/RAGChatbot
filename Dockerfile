@@ -20,4 +20,4 @@ COPY _data/ ./_data/
 EXPOSE 8501
 
 # Start application
-CMD ["streamlit", "run", "streamlit_app_tfdl", "--server.address=0.0.0.0", "--server.port=8501"]
+CMD ["streamlit", "run", "streamlit_app_tfdl.py", "--server.address=0.0.0.0", "--server.port=8501"]
