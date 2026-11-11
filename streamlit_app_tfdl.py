@@ -3,251 +3,363 @@ import os
 from pathlib import Path
 
 import streamlit as st
+import chromadb
+
 from dotenv import load_dotenv
-from openai import OpenAI
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from google import genai
+from google.genai import types
 
 
-# =====================================================
-# ENVIRONMENT CONFIGURATION
-# =====================================================
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_FOLDER = BASE_DIR / "_data"
 
-if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY is missing. Check your .env file.")
-    st.stop()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-
-# =====================================================
-# STREAMLIT CONFIGURATION
-# =====================================================
+TOP_K = 3
 
 st.set_page_config(
-    page_title="NovaTech Assistant",
+    page_title="NovaTech AI Assistant",
+    page_icon="🤖",
     layout="centered"
 )
 
+
+# ============================================================
+# 2. PAGE HEADER
+# ============================================================
+
 st.title("NovaTech AI Assistant")
-st.caption("Ask anything about company policy details")
+
+st.caption(
+    "Ask questions about NovaTech company policies, "
+    "employee benefits, leave, attendance and work policies."
+)
+
 st.divider()
 
 
-# =====================================================
-# GROQ CLIENT
-# =====================================================
+# ============================================================
+# 3. VALIDATE CONFIGURATION
+# ============================================================
 
-client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
+if not GEMINI_API_KEY:
+    st.error(
+        "GEMINI_API_KEY is missing. "
+        "Add it to your .env file or deployment environment variables."
+    )
+    st.stop()
 
-MODEL_NAME = "qwen/qwen3.8-27b"
+if not DATA_FOLDER.exists():
+    st.error(f"Policy documents folder not found: {DATA_FOLDER}")
+    st.stop()
 
-DATAFOLDER = Path(__file__).parent / "_data"
 
+# ============================================================
+# 4. DOCUMENT CHUNKING
+# ============================================================
 
-# =====================================================
-# LOAD DOCUMENTS AND CREATE TF-IDF VECTORS
-# =====================================================
+def load_documents():
 
-@st.cache_resource
-def load_rag():
-
-    if not DATAFOLDER.exists():
-        st.error(f"_data folder not found: {DATAFOLDER}")
-        st.stop()
-
-    chunks = []
+    documents = []
     metadatas = []
+    ids = []
 
     chunk_id = 0
 
-    # Read all TXT files
-    for filename in sorted(os.listdir(DATAFOLDER)):
+    for file_path in sorted(DATA_FOLDER.glob("*.txt")):
 
-        if not filename.lower().endswith(".txt"):
+        try:
+            text = file_path.read_text(encoding="utf-8")
+
+        except Exception as e:
+            print(f"Could not read {file_path.name}: {e}")
             continue
 
-        file_path = DATAFOLDER / filename
+        paragraphs = text.split("\n\n")
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            document_text = f.read()
+        for paragraph in paragraphs:
 
-        paragraphs = document_text.strip().split("\n")
+            paragraph = paragraph.strip()
 
-        for para in paragraphs:
-
-            para = para.strip()
-
-            if len(para) < 50:
+            if len(paragraph) < 50:
                 continue
 
-            if para.startswith("=="):
+            if paragraph.startswith("=="):
                 continue
 
-            chunks.append(para)
+            documents.append(paragraph)
 
             metadatas.append({
-                "source": filename,
-                "chunk_id": chunk_id
+                "sources": file_path.name
             })
+
+            ids.append(f"chunk_{chunk_id}")
 
             chunk_id += 1
 
-    if not chunks:
-        st.error("No valid document chunks found in _data.")
-        st.stop()
+    return documents, metadatas, ids
 
-    # Create TF-IDF vectorizer
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2)
+
+# ============================================================
+# 5. INITIALIZE CHROMADB AND GEMINI
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def initialize_rag(api_key, model_name):
+
+    # Initialize Gemini API
+    gemini_client = genai.Client(api_key=api_key)
+
+    # Initialize ChromaDB
+    chroma_client = chromadb.EphemeralClient()
+
+    collection = chroma_client.get_or_create_collection(
+        name="novatech_documents",
+        metadata={"hnsw:space": "cosine"}
     )
 
-    # Convert documents into TF-IDF vectors
-    tfidf_matrix = vectorizer.fit_transform(chunks)
+    # Load documents only if collection is empty
+    if collection.count() == 0:
 
-    return chunks, metadatas, vectorizer, tfidf_matrix
+        documents, metadatas, ids = load_documents()
+
+        if not documents:
+            raise ValueError(
+                "No valid text chunks found in the _data folder."
+            )
+
+        # Add in batches
+        batch_size = 100
+
+        for start in range(0, len(documents), batch_size):
+
+            end = start + batch_size
+
+            collection.add(
+                documents=documents[start:end],
+                metadatas=metadatas[start:end],
+                ids=ids[start:end]
+            )
+
+    return collection, gemini_client
 
 
-# =====================================================
-# INITIALIZE TF-IDF
-# =====================================================
+# ============================================================
+# 6. LOAD RAG COMPONENTS
+# ============================================================
 
-with st.spinner("Loading documents and creating TF-IDF vectors..."):
+try:
 
-    chunks, metadatas, vectorizer, tfidf_matrix = load_rag()
+    with st.spinner(
+        "Loading company policies and initializing Gemini..."
+    ):
 
-st.success(f"Ready! Indexed {len(chunks)} document chunks.")
+        collection, gemini_client = initialize_rag(
+            GEMINI_API_KEY,
+            GEMINI_MODEL
+        )
 
-st.caption(f"TF-IDF matrix shape: {tfidf_matrix.shape}")
+    st.success(
+        f"Knowledge base ready! "
+        f"{collection.count()} document chunks indexed."
+    )
+
+except Exception as e:
+
+    st.error(f"RAG initialization failed: {str(e)}")
+    st.stop()
+
 
 st.divider()
 
 
-# =====================================================
-# RAG QUESTION ANSWERING
-# =====================================================
+# ============================================================
+# 7. RETRIEVE RELEVANT DOCUMENTS
+# ============================================================
 
-def ask_rag(question: str):
+def retrieve_documents(question):
 
-    # Convert user question into TF-IDF vector
-    query_vector = vectorizer.transform([question])
+    if collection.count() == 0:
+        return [], []
 
-    # Calculate cosine similarity
-    similarities = cosine_similarity(
-        query_vector,
-        tfidf_matrix
-    ).flatten()
-
-    # Get top 3 matching document chunks
-    top_indices = similarities.argsort()[::-1][:3]
-
-    # Ignore irrelevant results
-    relevant_indices = [
-        i for i in top_indices
-        if similarities[i] > 0
-    ]
-
-    if not relevant_indices:
-
-        return (
-            "I could not find relevant information in the company documents.",
-            []
-        )
-
-    # Retrieve matching chunks
-    retrieved_chunks = [
-        chunks[i] for i in relevant_indices
-    ]
-
-    sources = list(dict.fromkeys(
-        metadatas[i]["source"]
-        for i in relevant_indices
-    ))
-
-    # Prepare context
-    context = "\n\n".join(retrieved_chunks)
-
-    messages = [
-
-        {
-            "role": "system",
-            "content": """
-            You are a helpful NovaTech company policy assistant.
-
-            Answer questions using ONLY the provided context.
-
-            Rules:
-            1. Do not invent information.
-            2. Do not use outside knowledge.
-            3. If the context does not contain the answer,
-               clearly say there is not enough information.
-            4. Provide clear and concise answers.
-            """
-        },
-
-        {
-            "role": "user",
-            "content": f"""
-            CONTEXT:
-            {context}
-
-            QUESTION:
-            {question}
-
-            ANSWER:
-            """
-        }
-
-    ]
-
-    # Generate response using Groq
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        temperature=0.2
+    results = collection.query(
+        query_texts=[question],
+        n_results=min(TOP_K, collection.count()),
+        include=["documents", "metadatas", "distances"]
     )
 
-    answer = response.choices[0].message.content
+    chunks = results["documents"][0] or []
+    metadata = results["metadatas"][0] or []
 
-    return answer, sources
+    sources = [
+        item.get("sources", "Unknown source")
+        if item else "Unknown source"
+        for item in metadata
+    ]
+
+    return chunks, sources
 
 
-# =====================================================
-# CHAT HISTORY
-# =====================================================
+# ============================================================
+# 8. GENERATE ANSWER USING GEMINI
+# ============================================================
+
+def ask_gemini(question, chunks, sources):
+
+    if not chunks:
+
+        return (
+            "I could not find relevant information in "
+            "the available company policy documents."
+        )
+
+    context = ""
+
+    for index, (chunk, source) in enumerate(
+        zip(chunks, sources), 1
+    ):
+
+        context += f"""
+        DOCUMENT CHUNK {index}
+        SOURCE: {source}
+
+        CONTENT:
+        {chunk}
+
+        -------------------------
+        """
+
+    prompt = f"""
+    You are NovaTech's company policy assistant.
+
+    Answer employee questions using ONLY the policy context
+    provided below.
+
+    STRICT RULES:
+
+    1. Do not invent company policies.
+    2. Do not use outside knowledge to answer policy questions.
+    3. If the answer is not available in the context,
+       clearly state:
+       "I could not find sufficient information in the
+       available NovaTech policy documents."
+    4. Provide a clear and helpful answer.
+    5. Use bullet points when appropriate.
+    6. When useful, mention the policy document filename.
+    7. Do not claim that a policy says something unless
+       the retrieved context supports it.
+
+    COMPANY POLICY CONTEXT:
+
+    {context}
+
+    EMPLOYEE QUESTION:
+
+    {question}
+
+    ANSWER:
+    """
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=1500
+        )
+    )
+
+    if not response.text:
+        return "Gemini returned an empty response. Please try again."
+
+    return response.text.strip()
+
+
+# ============================================================
+# 9. COMPLETE RAG PIPELINE
+# ============================================================
+
+def ask_rag(question):
+
+    chunks, sources = retrieve_documents(question)
+
+    answer = ask_gemini(
+        question,
+        chunks,
+        sources
+    )
+
+    return {
+        "answer": answer,
+        "sources": sorted(set(sources)),
+        "chunks": list(zip(chunks, sources))
+    }
+
+
+# ============================================================
+# 10. CHAT HISTORY
+# ============================================================
 
 if "messages" not in st.session_state:
+
     st.session_state.messages = []
 
 
-# Display previous messages
+# Display previous conversation
+
 for message in st.session_state.messages:
 
     with st.chat_message(message["role"]):
 
         st.markdown(message["content"])
 
-        if message["role"] == "assistant" and message.get("sources"):
-            st.caption(
-                "Sources: " + ", ".join(message["sources"])
-            )
+        if message["role"] == "assistant":
+
+            if message.get("sources"):
+
+                st.caption(
+                    "Sources: "
+                    + ", ".join(message["sources"])
+                )
+
+            if message.get("chunks"):
+
+                with st.expander(
+                    "View retrieved document chunks"
+                ):
+
+                    for index, item in enumerate(
+                        message["chunks"], 1
+                    ):
+
+                        chunk_text, source_file = item
+
+                        st.markdown(
+                            f"**Chunk {index} - {source_file}**"
+                        )
+
+                        st.info(chunk_text)
 
 
-# =====================================================
-# CHAT INPUT
-# =====================================================
+# ============================================================
+# 11. USER CHAT INPUT
+# ============================================================
 
-question = st.chat_input("Ask a company policy question...")
+question = st.chat_input(
+    "Ask anything about NovaTech company policies..."
+)
+
 
 if question:
 
+    # Display user question
     st.session_state.messages.append({
         "role": "user",
         "content": question
@@ -256,27 +368,89 @@ if question:
     with st.chat_message("user"):
         st.markdown(question)
 
+    # Generate assistant response
     with st.chat_message("assistant"):
 
-        with st.spinner("Searching company policies..."):
+        try:
 
-            try:
+            with st.spinner("Searching policies and asking Gemini..."):
 
-                answer, sources = ask_rag(question)
+                result = ask_rag(question)
 
-                st.markdown(answer)
+            st.markdown(result["answer"])
 
-                if sources:
-                    st.caption(
-                        "Sources: " + ", ".join(sources)
-                    )
+            if result["sources"]:
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": sources
-                })
+                st.caption(
+                    "Sources: "
+                    + ", ".join(result["sources"])
+                )
 
-            except Exception as e:
+            else:
 
-                st.error(f"Error generating response: {e}")
+                st.warning("No source documents were retrieved.")
+
+            with st.expander("View retrieved document chunks"):
+
+                if result["chunks"]:
+
+                    for index, (chunk, source) in enumerate(
+                        result["chunks"], 1
+                    ):
+
+                        st.markdown(
+                            f"**Chunk {index} - {source}**"
+                        )
+
+                        st.info(chunk)
+
+                else:
+
+                    st.write("No relevant chunks found.")
+
+            # Save assistant response
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": result["answer"],
+                "sources": result["sources"],
+                "chunks": result["chunks"]
+            })
+
+        except Exception as e:
+
+            st.error(f"Error generating response: {str(e)}")
+
+            st.info(
+                "Check your Gemini API key, model availability "
+                "and ChromaDB configuration."
+            )
+
+
+# ============================================================
+# 12. SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("NovaTech RAG Information")
+
+    st.metric(
+        "Indexed document chunks",
+        collection.count()
+    )
+
+    st.metric(
+        "Retrieved chunks per question",
+        TOP_K
+    )
+
+    st.write(f"**Gemini model:** {GEMINI_MODEL}")
+
+    st.divider()
+
+    if st.button("Clear Chat History", use_container_width=True):
+
+        st.session_state.messages = []
+        st.rerun()
+
+    st.caption("Powered by Google Gemini + ChromaDB + Streamlit")
